@@ -341,11 +341,61 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Binance futures RSI screener")
     parser.add_argument("--dry-run", action="store_true", help="只打印结果，不发邮件、不写 state")
     parser.add_argument("--max-symbols", type=int, default=0, help="只扫描前 N 个，用于本地验证")
+    parser.add_argument("--probe", action="store_true", help="只测各行情端点连通性，用于定位地区封锁")
     return parser.parse_args()
+
+
+PROBE_TARGETS = [
+    ("Binance 合约 fapi", "https://fapi.binance.com/fapi/v1/time"),
+    ("Binance 合约 fapi1", "https://fapi1.binance.com/fapi/v1/time"),
+    ("Binance 现货 vision", "https://data-api.binance.vision/api/v3/time"),
+    ("Binance.US 合约", "https://fapi.binance.us/fapi/v1/time"),
+    ("Bybit 合约", "https://api.bybit.com/v5/market/time"),
+    ("Gate 合约", "https://api.gateio.ws/api/v4/futures/usdt/contracts/BTC_USDT"),
+    ("Bitget 合约", "https://api.bitget.com/api/v2/mix/market/time?productType=usdt-futures"),
+    ("MEXC 合约", "https://contract.mexc.com/api/v1/contract/detail"),
+    ("OKX 合约", "https://www.okx.com/api/v5/public/time"),
+    ("KuCoin 合约", "https://api-futures.kucoin.com/api/v1/timestamp"),
+    ("Hyperliquid", "https://api.hyperliquid.xyz/info"),
+    ("CoinGecko", "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"),
+    # 候选源的 K 线形状，确认可达后照这个写适配器
+    ("vision 4h K线", "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=4h&limit=2"),
+    ("Gate 4h K线", "https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=BTC_USDT&interval=4h&limit=2"),
+    ("Bybit 4h K线", "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=240&limit=2"),
+]
+
+
+def probe_url(url: str) -> tuple[str, int, str]:
+    started = time.monotonic()
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "rsi-screen/1.0"})
+        with urllib.request.urlopen(request, timeout=12) as response:
+            return str(response.status), int((time.monotonic() - started) * 1000), response.read(160).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return f"HTTP {exc.code}", int((time.monotonic() - started) * 1000), exc.read(160).decode("utf-8", "replace")
+    except Exception as exc:  # 超时/DNS/TLS 都归到这里，只为打印诊断结果
+        return type(exc).__name__, int((time.monotonic() - started) * 1000), str(exc)[:120]
+
+
+def probe_endpoints() -> int:
+    egress = "取不到（该服务被拦）"
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        status, _, body = probe_url(url)
+        if status == "200" and len(body) < 40:
+            egress = body.strip()
+            break
+    print(f"出口 IP: {egress}\n")
+    print(f"{'端点':<20} {'状态':<12} {'延迟':>7}  响应")
+    for name, url in PROBE_TARGETS:
+        status, ms, snippet = probe_url(url)
+        print(f"{name:<20} {status:<12} {ms:>6}ms  {snippet[:70].replace(chr(10), ' ')}")
+    return 0
 
 
 def main() -> int:
     args = parse_args()
+    if args.probe:
+        return probe_endpoints()
     bad = [i for i in RSI_INTERVALS if i not in VALID_INTERVALS]
     if bad:
         raise SystemExit(f"不支持的周期: {bad}，可选 {sorted(VALID_INTERVALS)}")

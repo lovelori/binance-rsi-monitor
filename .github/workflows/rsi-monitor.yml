@@ -10,6 +10,10 @@ on:
         description: 只打印结果、不发邮件
         type: boolean
         default: false
+      probe:
+        description: 只测行情端点连通性（排查地区封锁）
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -37,7 +41,12 @@ jobs:
           key: rsi-state-${{ github.run_id }}
           restore-keys: rsi-state-
 
+      - name: Probe endpoints
+        if: github.event.inputs.probe == 'true'
+        run: python rsi_monitor.py --probe
+
       - name: Scan and mail
+        if: github.event.inputs.probe != 'true'
         run: python rsi_monitor.py ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
         env:
           RSI_PERIOD: "14"
