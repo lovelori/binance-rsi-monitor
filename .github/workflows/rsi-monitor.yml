@@ -1,0 +1,58 @@
+name: RSI overbought monitor
+
+on:
+  schedule:
+    # UTC 每 30 分钟一次。GitHub 定时任务在高峰期可能延迟数分钟到数十分钟
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 只打印结果、不发邮件
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rsi-monitor
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 冷却状态存在 Actions 缓存里，用递增 key 保证每次都能覆盖写回
+      - name: Restore alert state
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: rsi-state-${{ github.run_id }}
+          restore-keys: rsi-state-
+
+      - name: Scan and mail
+        run: python rsi_monitor.py ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+        env:
+          RSI_PERIOD: "14"
+          RSI_THRESHOLD: "80"
+          RSI_INTERVALS: "4h,1d"
+          # any = 任一周期 RSI>阈值即推送；改成 all 则要求两个周期同时满足
+          MATCH_MODE: any
+          MIN_QUOTE_VOLUME: "1000000"
+          ALERT_COOLDOWN_HOURS: "6"
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM_NAME: Binance RSI Monitor
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+
+      - name: Show alert state
+        run: cat state/last_alerts.json || echo "no state yet"
