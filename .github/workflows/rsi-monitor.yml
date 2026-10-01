@@ -2,8 +2,8 @@ name: RSI overbought monitor
 
 on:
   schedule:
-    # UTC 每 30 分钟一次。GitHub 定时任务在高峰期可能延迟数分钟到数十分钟
-    - cron: "*/30 * * * *"
+    # UTC 偶数整点各跑一次。GitHub 定时任务在高峰期可能延迟数分钟到数十分钟
+    - cron: "0 */2 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
