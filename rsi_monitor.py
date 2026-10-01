@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Screen Binance USDT-M perpetual futures for overbought RSI and mail the hits.
+"""Screen USDT-M perpetual futures for overbought RSI and mail the hits.
 
+Defaults to Gate's public futures API because Binance returns HTTP 451 for the
+US IPs GitHub Actions runners use; DATA_SOURCE=binance still works behind a proxy.
 Stdlib only, so CI needs no dependency install.
 """
 
@@ -44,18 +46,36 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
-BASE_URL = env("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com").rstrip("/")
+DATA_SOURCE = env("DATA_SOURCE", "gate").lower()
+SOURCES = {
+    "gate": {
+        "api": env("GATE_FUTURES_API_BASE", "https://api.gateio.ws/api/v4/futures/usdt"),
+        "label": "Gate USDT 永续",
+        "trade_url": "https://www.gate.cn/futures/trade/usdt/",
+        "interval_map": {"1M": "30d"},
+    },
+    "binance": {
+        "api": env("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com") + "/fapi/v1",
+        "label": "Binance USDT 永续",
+        "trade_url": "https://www.binance.com/zh-CN/futures/",
+        "interval_map": {},
+    },
+}
+if DATA_SOURCE not in SOURCES:
+    raise SystemExit(f"DATA_SOURCE 只支持 {sorted(SOURCES)}，当前为 {DATA_SOURCE!r}")
+SRC = SOURCES[DATA_SOURCE]
+API_BASE = SRC["api"].rstrip("/")
+
 RSI_PERIOD = env_int("RSI_PERIOD", 14)
 RSI_THRESHOLD = env_float("RSI_THRESHOLD", 80.0)
 RSI_INTERVALS = [i.strip() for i in env("RSI_INTERVALS", "4h,1d").split(",") if i.strip()]
 MATCH_MODE = env("MATCH_MODE", "any").lower()  # any=任一周期超阈值即推送，all=所有周期都要超阈值
 # 币安 K 线接口 limit<100 时权重为 1，去掉未收盘的一根仍有 98 根，足够 Wilder RSI 收敛
 KLINE_LIMIT = env_int("KLINE_LIMIT", 99)
-QUOTE_ASSETS = [q.strip().upper() for q in env("QUOTE_ASSETS", "USDT").split(",") if q.strip()]
 MIN_QUOTE_VOLUME = env_float("MIN_QUOTE_VOLUME", 1_000_000)
 COOLDOWN_HOURS = env_float("ALERT_COOLDOWN_HOURS", 6)
 STATE_FILE = Path(env("STATE_FILE", "state/last_alerts.json"))
-REQUESTS_PER_SECOND = env_float("REQUESTS_PER_SECOND", 5)
+REQUESTS_PER_SECOND = env_float("REQUESTS_PER_SECOND", 10)
 WORKERS = env_int("WORKERS", 8)
 TOP_N_LOG = env_int("TOP_N_LOG", 20)
 
@@ -75,9 +95,10 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(errors="replace")
 
 
-def http_json(path: str, params: dict | None = None) -> object:
+def http_json(url: str, params: dict | None = None) -> object:
     query = urllib.parse.urlencode(params or {})
-    url = f"{BASE_URL}{path}?{query}" if query else BASE_URL + path
+    url = f"{url}?{query}" if query else url
+    path = url.split("?")[0].rsplit("/", 2)[-1]
     last_error = ""
     for attempt in range(1, 6):
         _throttle()
@@ -92,10 +113,10 @@ def http_json(path: str, params: dict | None = None) -> object:
                 wait = int(exc.headers.get("Retry-After") or 30)
                 log(f"限频 {exc.code}，等待 {wait}s")
                 time.sleep(wait + 1)
-            elif exc.code in (403, 451):
+            elif exc.code in (403, 451) and DATA_SOURCE == "binance":
                 last_error += (
                     " | 币安对受限地区 IP 会返回 403/451，GitHub Actions 的美国 Runner 常被拦。"
-                    "把 BINANCE_FUTURES_BASE_URL 指向自建反代，或给该 Secret 配 HTTPS_PROXY"
+                    "换 DATA_SOURCE=gate，或把 BINANCE_FUTURES_BASE_URL 指向自建反代"
                 )
                 break
             elif 500 <= exc.code < 600:
@@ -162,43 +183,74 @@ class Row:
 
 
 def load_universe() -> tuple[list[str], dict[str, Row]]:
-    info = http_json("/fapi/v1/exchangeInfo")
-    symbols = [
-        item["symbol"]
-        for item in info["symbols"]
-        if item.get("status") == "TRADING"
-        and item.get("contractType") == "PERPETUAL"
-        and item.get("quoteAsset") in QUOTE_ASSETS
-    ]
-    tickers = {}
-    for item in http_json("/fapi/v1/ticker/24hr"):
-        if item["symbol"] in symbols:
-            tickers[item["symbol"]] = Row(
-                symbol=item["symbol"],
-                last_price=float(item["lastPrice"]),
-                change_percent=float(item.get("priceChangePercent") or 0.0),
-                quote_volume=float(item.get("quoteVolume") or 0.0),
+    if DATA_SOURCE == "gate":
+        # Gate 的 USDT-M 列表里混着股票/指数/外汇永续（contract_type 非空），只留加密货币
+        tradable = {
+            item["name"]
+            for item in http_json(f"{API_BASE}/contracts")
+            if item.get("status") == "trading"
+            and not item.get("in_delisting")
+            and not item.get("is_pre_market")
+            and not item.get("contract_type")
+            and item["name"].endswith("_USDT")
+        }
+        tickers = {
+            item["contract"]: Row(
+                symbol=item["contract"],
+                last_price=float(item["last"] or 0),
+                change_percent=float(item.get("change_percentage") or 0),
+                quote_volume=float(item.get("volume_24h_quote") or 0),
             )
-    liquid = [s for s in symbols if s in tickers and tickers[s].quote_volume >= MIN_QUOTE_VOLUME]
-    log(f"合约 {len(symbols)} 个，24h 成交额≥{MIN_QUOTE_VOLUME:,.0f} 的候选 {len(liquid)} 个")
+            for item in http_json(f"{API_BASE}/tickers")
+            if item["contract"] in tradable
+        }
+    else:
+        tradable = {
+            item["symbol"]
+            for item in http_json(f"{API_BASE}/exchangeInfo")["symbols"]
+            if item.get("status") == "TRADING"
+            and item.get("contractType") == "PERPETUAL"
+            and item.get("quoteAsset") == "USDT"
+        }
+        tickers = {
+            item["symbol"]: Row(
+                symbol=item["symbol"],
+                last_price=float(item["lastPrice"] or 0),
+                change_percent=float(item.get("priceChangePercent") or 0),
+                quote_volume=float(item.get("quoteVolume") or 0),
+            )
+            for item in http_json(f"{API_BASE}/ticker/24hr")
+            if item["symbol"] in tradable
+        }
+    if not tradable:
+        raise SystemExit(f"{SRC['label']} 未返回任何可交易合约，接口可能变更")
+    liquid = [s for s in sorted(tradable) if s in tickers and tickers[s].quote_volume >= MIN_QUOTE_VOLUME]
+    log(f"{SRC['label']} 共 {len(tradable)} 个合约，24h 成交额≥{MIN_QUOTE_VOLUME:,.0f} 的候选 {len(liquid)} 个")
     return liquid, tickers
 
 
+def fetch_closes(symbol: str, interval: str) -> list[float]:
+    """收盘价，按时间升序，最后一根尚未收盘。"""
+    iv = SRC["interval_map"].get(interval, interval)
+    if DATA_SOURCE == "gate":
+        bars = http_json(f"{API_BASE}/candlesticks", {"contract": symbol, "interval": iv, "limit": KLINE_LIMIT})
+        return [float(bar["c"]) for bar in bars]
+    bars = http_json(f"{API_BASE}/klines", {"symbol": symbol, "interval": iv, "limit": KLINE_LIMIT})
+    return [float(bar[4]) for bar in bars]
+
+
 def fetch_rsi(symbol: str) -> dict[str, float | None]:
-    closes: dict[str, float | None] = {}
+    result: dict[str, float | None] = {}
     for interval in RSI_INTERVALS:
         try:
-            candles = http_json(
-                "/fapi/v1/klines",
-                {"symbol": symbol, "interval": interval, "limit": KLINE_LIMIT},
-            )
+            closes = fetch_closes(symbol, interval)
             # 最后一根通常尚未收盘，用未收盘数据会导致 RSI 抖动和重复告警
-            bars = candles[:-1] if len(candles) > RSI_PERIOD + 1 else candles
-            closes[interval] = wilder_rsi([float(bar[4]) for bar in bars], RSI_PERIOD)
-        except RuntimeError as exc:
+            closed = closes[:-1] if len(closes) > RSI_PERIOD + 1 else closes
+            result[interval] = wilder_rsi(closed, RSI_PERIOD)
+        except (RuntimeError, KeyError, TypeError, ValueError) as exc:
             log(f"{symbol} {interval} 取数失败: {exc}")
-            closes[interval] = None
-    return closes
+            result[interval] = None
+    return result
 
 
 def screen(symbols: list[str], tickers: dict[str, Row]) -> list[Row]:
@@ -249,7 +301,10 @@ def fmt_price(value: float) -> str:
 
 
 def render_text(rows: list[Row], generated: datetime) -> str:
-    lines = [f"RSI>{RSI_THRESHOLD:g} 筛选结果（{', '.join(RSI_INTERVALS)}，{generated:%Y-%m-%d %H:%M} UTC）", ""]
+    lines = [
+        f"{SRC['label']} RSI>{RSI_THRESHOLD:g}（{', '.join(RSI_INTERVALS)}，{generated:%Y-%m-%d %H:%M} UTC）",
+        "",
+    ]
     for row in rows:
         rsi_text = "  ".join(f"{i}={row.rsi[i]:.1f}" for i in RSI_INTERVALS if row.rsi.get(i) is not None)
         lines.append(
@@ -279,7 +334,7 @@ def render_html(rows: list[Row], generated: datetime) -> str:
                 continue
             color = "#c0392b" if value > RSI_THRESHOLD else "#222222"
             cells += f'<td style="padding:6px 10px;text-align:right;color:{color}">{value:.1f}</td>'
-        url = "https://www.binance.com/zh-CN/futures/" + escape(row.symbol)
+        url = SRC["trade_url"] + escape(row.symbol)
         body.append(
             '<tr>'
             f'<td style="padding:6px 10px"><a href="{url}">{escape(row.symbol)}</a></td>'
@@ -296,7 +351,7 @@ def render_html(rows: list[Row], generated: datetime) -> str:
     )
     return (
         "<div style='font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#222'>"
-        "<h3 style='margin:0 0 4px'>Binance 合约超买监控</h3>"
+        f"<h3 style='margin:0 0 4px'>{escape(SRC['label'])} 超买监控</h3>"
         f"<p style='margin:0 0 14px;color:#666666;font-size:13px'>{intro}</p>"
         "<table cellspacing=0 cellpadding=0 style='border-collapse:collapse;font-size:13px'>"
         f"<thead><tr>{header}</tr></thead><tbody>{''.join(body)}</tbody></table>"

@@ -49,6 +49,8 @@ jobs:
         if: github.event.inputs.probe != 'true'
         run: python rsi_monitor.py ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
         env:
+          # gate：币安合约接口对美国 IP 返回 451，Runner 上只有 Gate 等少数交易所可达
+          DATA_SOURCE: gate
           RSI_PERIOD: "14"
           RSI_THRESHOLD: "80"
           RSI_INTERVALS: "4h,1d"
