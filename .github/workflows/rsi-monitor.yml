@@ -56,7 +56,12 @@ jobs:
           RSI_INTERVALS: "4h,1d"
           # any = 任一周期 RSI>阈值即推送；改成 all 则要求两个周期同时满足
           MATCH_MODE: any
-          MIN_QUOTE_VOLUME: "1000000"
+          # 覆盖范围：100k 约 200 个候选；降到 30000 约 290 个，升到 1000000 约 77 个
+          MIN_QUOTE_VOLUME: "100000"
+          # 费率为正 = 多头向空头支付，多头拥挤
+          REQUIRE_POSITIVE_FUNDING: "1"
+          # 用币安现货上线名单剔除 Gate 独有标的（币安合约接口被地区封锁，拿不到合约名单）
+          REQUIRE_ON_BINANCE: "1"
           ALERT_COOLDOWN_HOURS: "6"
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}

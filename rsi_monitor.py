@@ -72,7 +72,10 @@ RSI_INTERVALS = [i.strip() for i in env("RSI_INTERVALS", "4h,1d").split(",") if 
 MATCH_MODE = env("MATCH_MODE", "any").lower()  # any=任一周期超阈值即推送，all=所有周期都要超阈值
 # 币安 K 线接口 limit<100 时权重为 1，去掉未收盘的一根仍有 98 根，足够 Wilder RSI 收敛
 KLINE_LIMIT = env_int("KLINE_LIMIT", 99)
-MIN_QUOTE_VOLUME = env_float("MIN_QUOTE_VOLUME", 1_000_000)
+MIN_QUOTE_VOLUME = env_float("MIN_QUOTE_VOLUME", 100_000)
+REQUIRE_POSITIVE_FUNDING = env("REQUIRE_POSITIVE_FUNDING", "1") not in ("0", "false", "no")
+REQUIRE_ON_BINANCE = env("REQUIRE_ON_BINANCE", "1") not in ("0", "false", "no")
+BINANCE_SPOT_API = env("BINANCE_SPOT_BASE_URL", "https://data-api.binance.vision/api/v3").rstrip("/")
 COOLDOWN_HOURS = env_float("ALERT_COOLDOWN_HOURS", 6)
 STATE_FILE = Path(env("STATE_FILE", "state/last_alerts.json"))
 REQUESTS_PER_SECOND = env_float("REQUESTS_PER_SECOND", 10)
@@ -123,8 +126,10 @@ def http_json(url: str, params: dict | None = None) -> object:
                 time.sleep(min(2**attempt, 30))
             else:
                 break
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            last_error = str(exc)
+        except (OSError, json.JSONDecodeError) as exc:
+            # OSError 覆盖 URLError、连接重置和 ssl.SSLError（后者不是 URLError 子类，
+            # 早先漏掉它会让一条坏 TLS 记录直接崩掉整个定时任务）
+            last_error = str(exc) or type(exc).__name__
             time.sleep(min(2**attempt, 30))
     raise RuntimeError(f"{path} 请求失败: {last_error}")
 
@@ -163,15 +168,25 @@ def wilder_rsi(closes: list[float], period: int) -> float | None:
 @dataclass
 class Row:
     symbol: str
+    base: str
     last_price: float
     change_percent: float
     quote_volume: float
+    funding_rate: float | None = None
+    funding_interval: int = 28800
     rsi: dict[str, float | None] = field(default_factory=dict)
 
     @property
     def max_rsi(self) -> float:
         values = [v for v in self.rsi.values() if v is not None]
         return max(values) if values else 0.0
+
+    @property
+    def funding_text(self) -> str:
+        if self.funding_rate is None:
+            return "-"
+        hours = max(1, round(self.funding_interval / 3600))
+        return f"{self.funding_rate * 100:+.4f}%/{hours}h"
 
     def triggered(self, threshold: float, mode: str) -> bool:
         values = [v for v in self.rsi.values() if v is not None]
@@ -182,51 +197,97 @@ class Row:
         )
 
 
+def binance_spot_bases() -> set[str] | None:
+    """币安现货上线的基数币种，用来剔除 Gate 独有的标的。
+
+    币安合约接口本身被地区封锁，只能用同域的现货镜像代替：极少数"只有合约、没有现货"
+    的新币会被误剔，需要时把 REQUIRE_ON_BINANCE 设为 0。
+    """
+    try:
+        info = http_json(f"{BINANCE_SPOT_API}/exchangeInfo")
+    except RuntimeError as exc:
+        log(f"币安现货列表取不到，跳过“币安是否上线”过滤: {exc}")
+        return None
+    return {
+        item["baseAsset"]
+        for item in info["symbols"]
+        if item.get("status") == "TRADING" and item.get("quoteAsset") == "USDT"
+    }
+
+
 def load_universe() -> tuple[list[str], dict[str, Row]]:
     if DATA_SOURCE == "gate":
-        # Gate 的 USDT-M 列表里混着股票/指数/外汇永续（contract_type 非空），只留加密货币
-        tradable = {
-            item["name"]
-            for item in http_json(f"{API_BASE}/contracts")
-            if item.get("status") == "trading"
-            and not item.get("in_delisting")
-            and not item.get("is_pre_market")
-            and not item.get("contract_type")
-            and item["name"].endswith("_USDT")
-        }
-        tickers = {
-            item["contract"]: Row(
-                symbol=item["contract"],
-                last_price=float(item["last"] or 0),
-                change_percent=float(item.get("change_percentage") or 0),
-                quote_volume=float(item.get("volume_24h_quote") or 0),
+        contracts = http_json(f"{API_BASE}/contracts")
+        quotes = {item["contract"]: item for item in http_json(f"{API_BASE}/tickers")}
+        rows = {}
+        for item in contracts:
+            name = item["name"]
+            # Gate 的 USDT-M 列表里混着股票/指数/外汇永续（contract_type 非空），只留加密货币
+            if not (
+                item.get("status") == "trading"
+                and not item.get("in_delisting")
+                and not item.get("is_pre_market")
+                and not item.get("contract_type")
+                and name.endswith("_USDT")
+                and name in quotes
+            ):
+                continue
+            ticker = quotes[name]
+            rate = item.get("funding_rate") or item.get("funding_rate_indicative")
+            rows[name] = Row(
+                symbol=name,
+                base=name[: -len("_USDT")],
+                last_price=float(ticker["last"] or 0),
+                change_percent=float(ticker.get("change_percentage") or 0),
+                quote_volume=float(ticker.get("volume_24h_quote") or 0),
+                funding_rate=float(rate) if rate not in (None, "") else None,
+                funding_interval=int(item.get("funding_interval") or 28800),
             )
-            for item in http_json(f"{API_BASE}/tickers")
-            if item["contract"] in tradable
-        }
     else:
         tradable = {
-            item["symbol"]
+            item["symbol"]: item["baseAsset"]
             for item in http_json(f"{API_BASE}/exchangeInfo")["symbols"]
             if item.get("status") == "TRADING"
             and item.get("contractType") == "PERPETUAL"
             and item.get("quoteAsset") == "USDT"
         }
-        tickers = {
-            item["symbol"]: Row(
-                symbol=item["symbol"],
+        funding = {
+            item["symbol"]: item.get("lastFundingRate")
+            for item in http_json(f"{API_BASE}/premiumIndex")
+        }
+        rows = {}
+        for item in http_json(f"{API_BASE}/ticker/24hr"):
+            symbol = item["symbol"]
+            if symbol not in tradable:
+                continue
+            rate = funding.get(symbol)
+            rows[symbol] = Row(
+                symbol=symbol,
+                base=tradable[symbol],
                 last_price=float(item["lastPrice"] or 0),
                 change_percent=float(item.get("priceChangePercent") or 0),
                 quote_volume=float(item.get("quoteVolume") or 0),
+                funding_rate=float(rate) if rate not in (None, "") else None,
             )
-            for item in http_json(f"{API_BASE}/ticker/24hr")
-            if item["symbol"] in tradable
-        }
-    if not tradable:
+    if not rows:
         raise SystemExit(f"{SRC['label']} 未返回任何可交易合约，接口可能变更")
-    liquid = [s for s in sorted(tradable) if s in tickers and tickers[s].quote_volume >= MIN_QUOTE_VOLUME]
-    log(f"{SRC['label']} 共 {len(tradable)} 个合约，24h 成交额≥{MIN_QUOTE_VOLUME:,.0f} 的候选 {len(liquid)} 个")
-    return liquid, tickers
+    return apply_filters(rows)
+
+
+def apply_filters(rows: dict[str, Row]) -> tuple[list[str], dict[str, Row]]:
+    kept = [row for row in rows.values() if row.quote_volume >= MIN_QUOTE_VOLUME]
+    log(f"{SRC['label']} {len(rows)} 个合约 → 成交额≥{MIN_QUOTE_VOLUME:,.0f} 剩 {len(kept)} 个")
+    listed = binance_spot_bases() if REQUIRE_ON_BINANCE else None
+    if listed is not None:
+        dropped = [row for row in kept if row.base not in listed]
+        kept = [row for row in kept if row.base in listed]
+        log(f"剔除币安未上线 {len(dropped)} 个: {' '.join(row.base for row in dropped[:10])}"
+            f"{' …' if len(dropped) > 10 else ''}")
+    if REQUIRE_POSITIVE_FUNDING:
+        dropped = [row for row in kept if not (row.funding_rate or 0) > 0]
+        kept = [row for row in kept if (row.funding_rate or 0) > 0]
+        log(f"剔除费率≤0 {len(dropped)} 个")
+    return sorted(row.symbol for row in kept), rows
 
 
 def fetch_closes(symbol: str, interval: str) -> list[float]:
@@ -300,18 +361,28 @@ def fmt_price(value: float) -> str:
     return f"{value:.8f}".rstrip("0").rstrip(".")
 
 
+def filter_summary() -> str:
+    parts = [f"成交额≥{MIN_QUOTE_VOLUME:,.0f}"]
+    if REQUIRE_POSITIVE_FUNDING:
+        parts.append("费率>0")
+    if REQUIRE_ON_BINANCE:
+        parts.append("币安已上线")
+    return " · ".join(parts)
+
+
 def render_text(rows: list[Row], generated: datetime) -> str:
     lines = [
         f"{SRC['label']} RSI>{RSI_THRESHOLD:g}（{', '.join(RSI_INTERVALS)}，{generated:%Y-%m-%d %H:%M} UTC）",
+        f"附加条件：{filter_summary()}",
         "",
     ]
     for row in rows:
         rsi_text = "  ".join(f"{i}={row.rsi[i]:.1f}" for i in RSI_INTERVALS if row.rsi.get(i) is not None)
         lines.append(
             f"{row.symbol}: {fmt_price(row.last_price)}  {row.change_percent:+.2f}%  {rsi_text}  "
-            f"成交额{row.quote_volume / 1e6:.1f}M"
+            f"费率{row.funding_text}  成交额{row.quote_volume / 1e6:.1f}M"
         )
-    lines += ["", "基于已收盘 K 线，Wilder RSI，仅供参考，不构成投资建议。"]
+    lines += ["", "基于已收盘 K 线，Wilder RSI；费率为正表示多头向空头支付。仅供参考，不构成投资建议。"]
     return "\n".join(lines)
 
 
@@ -322,6 +393,7 @@ def render_html(rows: list[Row], generated: datetime) -> str:
         f'<th style="{th}right">最新价</th>'
         f'<th style="{th}right">24h</th>'
         + "".join(f'<th style="{th}right">RSI({escape(i)})</th>' for i in RSI_INTERVALS)
+        + f'<th style="{th}right">资金费率</th>'
         + f'<th style="{th}right">24h成交额</th>'
     )
     body = []
@@ -335,19 +407,22 @@ def render_html(rows: list[Row], generated: datetime) -> str:
             color = "#c0392b" if value > RSI_THRESHOLD else "#222222"
             cells += f'<td style="padding:6px 10px;text-align:right;color:{color}">{value:.1f}</td>'
         url = SRC["trade_url"] + escape(row.symbol)
+        funding_color = "#b8860b" if (row.funding_rate or 0) > 0 else "#2e7d32"
         body.append(
             '<tr>'
             f'<td style="padding:6px 10px"><a href="{url}">{escape(row.symbol)}</a></td>'
             f'<td style="padding:6px 10px;text-align:right">{escape(fmt_price(row.last_price))}</td>'
             f'<td style="padding:6px 10px;text-align:right">{row.change_percent:+.2f}%</td>'
             f'{cells}'
+            f'<td style="padding:6px 10px;text-align:right;color:{funding_color}">{escape(row.funding_text)}</td>'
             f'<td style="padding:6px 10px;text-align:right">{row.quote_volume / 1e6:.1f}M</td>'
             '</tr>'
         )
-    note = "基于已收盘 K 线，Wilder RSI。仅供参考，不构成投资建议。"
+    note = "基于已收盘 K 线，Wilder RSI；费率为正表示多头向空头支付。仅供参考，不构成投资建议。"
     intro = (
         f"周期 {escape(', '.join(RSI_INTERVALS))} · RSI 周期 {RSI_PERIOD} · 阈值 {RSI_THRESHOLD:g} · "
-        f"匹配 {escape(MATCH_MODE)} · {generated:%Y-%m-%d %H:%M} UTC · 共 {len(rows)} 个"
+        f"匹配 {escape(MATCH_MODE)} · {escape(filter_summary())} · "
+        f"{generated:%Y-%m-%d %H:%M} UTC · 共 {len(rows)} 个"
     )
     return (
         "<div style='font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#222'>"
@@ -465,7 +540,7 @@ def main() -> int:
 
     for row in rows[:TOP_N_LOG]:
         detail = "  ".join(f"{i}={row.rsi[i]:.1f}" for i in RSI_INTERVALS if row.rsi.get(i) is not None)
-        log(f"{row.symbol:<16} {detail:<24} {row.change_percent:+7.2f}%  {row.quote_volume / 1e6:8.1f}M")
+        log(f"{row.symbol:<16} {detail:<24} {row.change_percent:+7.2f}%  {row.funding_text:>14}  {row.quote_volume / 1e6:8.1f}M")
 
     hits = [r for r in rows if r.triggered(RSI_THRESHOLD, MATCH_MODE)]
     generated = datetime.now(timezone.utc)
