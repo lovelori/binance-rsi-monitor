@@ -63,6 +63,10 @@ jobs:
           # 用币安现货上线名单剔除 Gate 独有标的（币安合约接口被地区封锁，拿不到合约名单）
           REQUIRE_ON_BINANCE: "1"
           ALERT_COOLDOWN_HOURS: "6"
+          # 摘要指标窗口：布林周期 / 量比对比根数 / 背离回看根数
+          BOLL_PERIOD: "20"
+          VOL_LOOKBACK: "20"
+          DIV_LOOKBACK: "10"
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}

@@ -69,9 +69,13 @@ API_BASE = SRC["api"].rstrip("/")
 RSI_PERIOD = env_int("RSI_PERIOD", 14)
 RSI_THRESHOLD = env_float("RSI_THRESHOLD", 80.0)
 RSI_INTERVALS = [i.strip() for i in env("RSI_INTERVALS", "4h,1d").split(",") if i.strip()]
+PRIMARY_INTERVAL = RSI_INTERVALS[0] if RSI_INTERVALS else "4h"
 MATCH_MODE = env("MATCH_MODE", "any").lower()  # any=任一周期超阈值即推送，all=所有周期都要超阈值
 # 币安 K 线接口 limit<100 时权重为 1，去掉未收盘的一根仍有 98 根，足够 Wilder RSI 收敛
 KLINE_LIMIT = env_int("KLINE_LIMIT", 99)
+BOLL_PERIOD = env_int("BOLL_PERIOD", 20)
+VOL_LOOKBACK = env_int("VOL_LOOKBACK", 20)
+DIV_LOOKBACK = env_int("DIV_LOOKBACK", 10)
 MIN_QUOTE_VOLUME = env_float("MIN_QUOTE_VOLUME", 100_000)
 REQUIRE_POSITIVE_FUNDING = env("REQUIRE_POSITIVE_FUNDING", "1") not in ("0", "false", "no")
 REQUIRE_ON_BINANCE = env("REQUIRE_ON_BINANCE", "1") not in ("0", "false", "no")
@@ -146,9 +150,10 @@ def _throttle() -> None:
         time.sleep(wait)
 
 
-def wilder_rsi(closes: list[float], period: int) -> float | None:
+def wilder_rsi_series(closes: list[float], period: int) -> list[float]:
+    """逐根 Wilder RSI，series[i] 对应 closes[i + period]。"""
     if len(closes) < period + 1:
-        return None
+        return []
     gains = losses = 0.0
     for index in range(1, period + 1):
         delta = closes[index] - closes[index - 1]
@@ -156,13 +161,69 @@ def wilder_rsi(closes: list[float], period: int) -> float | None:
         losses += max(-delta, 0.0)
     avg_gain = gains / period
     avg_loss = losses / period
+    series = [_rsi_of(avg_gain, avg_loss)]
     for index in range(period + 1, len(closes)):
         delta = closes[index] - closes[index - 1]
         avg_gain = (avg_gain * (period - 1) + max(delta, 0.0)) / period
         avg_loss = (avg_loss * (period - 1) + max(-delta, 0.0)) / period
+        series.append(_rsi_of(avg_gain, avg_loss))
+    return series
+
+
+def _rsi_of(avg_gain: float, avg_loss: float) -> float:
     if avg_loss == 0:
         return 100.0
     return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+
+
+def wilder_rsi(closes: list[float], period: int) -> float | None:
+    series = wilder_rsi_series(closes, period)
+    return series[-1] if series else None
+
+
+def wilder_atr(highs: list[float], lows: list[float], closes: list[float], period: int) -> float | None:
+    if len(closes) < period + 1:
+        return None
+    true_ranges = [
+        max(high - low, abs(high - closes[i - 1]), abs(low - closes[i - 1]))
+        for i, (high, low) in enumerate(zip(highs[1:], lows[1:]), start=1)
+    ]
+    atr = sum(true_ranges[:period]) / period
+    for true_range in true_ranges[period:]:
+        atr = (atr * (period - 1) + true_range) / period
+    return atr
+
+
+def boll_percent_b(closes: list[float], period: int) -> float | None:
+    """收盘在布林带（中轨±2σ）里的位置，>1 表示收在上轨之上。"""
+    window = closes[-period:]
+    if len(window) < period:
+        return None
+    mean = sum(window) / period
+    stdev = (sum((value - mean) ** 2 for value in window) / period) ** 0.5
+    if stdev == 0:
+        return None
+    return (closes[-1] - (mean - 2 * stdev)) / (4 * stdev)
+
+
+def volume_ratio(volumes: list[float], lookback: int) -> float | None:
+    """最后一根成交额 ÷ 之前 lookback 根均值。"""
+    if len(volumes) < lookback + 1:
+        return None
+    base = sum(volumes[-lookback - 1 : -1]) / lookback
+    return volumes[-1] / base if base > 0 else None
+
+
+def bearish_divergence(closes: list[float], rsi_series: list[float], lookback: int) -> bool:
+    """价创近端新高但 RSI 没跟上：多头动能已衰竭的超买更值得提示。
+
+    用严格小于，否则 RSI 钉在 100 的单边涨会被误判成背离（100 不可能再创新高）。
+    """
+    if len(closes) < lookback + 1 or len(rsi_series) < lookback + 1:
+        return False
+    price_high = closes[-1] >= max(closes[-lookback - 1 : -1])
+    rsi_lower = rsi_series[-1] < max(rsi_series[-lookback - 1 : -1])
+    return price_high and rsi_lower
 
 
 @dataclass
@@ -174,7 +235,10 @@ class Row:
     quote_volume: float
     funding_rate: float | None = None
     funding_interval: int = 28800
+    basis_percent: float | None = None
+    high_24h: float | None = None
     rsi: dict[str, float | None] = field(default_factory=dict)
+    metrics: dict[str, dict] = field(default_factory=dict)
 
     @property
     def max_rsi(self) -> float:
@@ -187,6 +251,37 @@ class Row:
             return "-"
         hours = max(1, round(self.funding_interval / 3600))
         return f"{self.funding_rate * 100:+.4f}%/{hours}h"
+
+    @property
+    def basis_text(self) -> str:
+        return "-" if self.basis_percent is None else f"{self.basis_percent:+.3f}%"
+
+    def _metric(self, key: str):
+        return (self.metrics.get(PRIMARY_INTERVAL) or {}).get(key)
+
+    @property
+    def vol_ratio_text(self) -> str:
+        value = self._metric("vol_ratio")
+        return "-" if value is None else f"{value:.1f}×"
+
+    @property
+    def summary(self) -> str:
+        """主周期细节，文字和 HTML 两种排版共用。"""
+        parts = []
+        rsi, prev = self._metric("rsi"), self._metric("rsi_prev")
+        if rsi is not None and prev is not None:
+            parts.append(f"RSI {prev:.1f}→{rsi:.1f}（{rsi - prev:+.1f}）")
+        if self._metric("divergence"):
+            parts.append("价新高但RSI未新高")
+        pct_b = self._metric("pct_b")
+        if pct_b is not None:
+            parts.append(f"%B {pct_b:.2f}")
+        atr_pct = self._metric("atr_pct")
+        if atr_pct is not None:
+            parts.append(f"ATR {atr_pct:.1f}%")
+        if self.high_24h:
+            parts.append(f"距24h高 {(self.last_price / self.high_24h - 1) * 100:+.1f}%")
+        return f"{PRIMARY_INTERVAL}：" + " · ".join(parts) if parts else "-"
 
     def triggered(self, threshold: float, mode: str) -> bool:
         values = [v for v in self.rsi.values() if v is not None]
@@ -213,6 +308,19 @@ def binance_spot_bases() -> set[str] | None:
         for item in info["symbols"]
         if item.get("status") == "TRADING" and item.get("quoteAsset") == "USDT"
     }
+
+
+def _basis(last, index) -> float | None:
+    """最新成交价对指数价的溢价：正数说明合约被多头买到了现货之上。
+
+    不用 mark_price：标记价本身被设计成贴着指数走，实测 |last-index| 的中位偏离是
+    |mark-index| 的近 3 倍，用标记价会把溢价压成噪声。
+    """
+    try:
+        last, index = float(last or 0), float(index or 0)
+    except (TypeError, ValueError):
+        return None
+    return (last - index) / index * 100 if last and index else None
 
 
 def load_universe() -> tuple[list[str], dict[str, Row]]:
@@ -242,6 +350,8 @@ def load_universe() -> tuple[list[str], dict[str, Row]]:
                 quote_volume=float(ticker.get("volume_24h_quote") or 0),
                 funding_rate=float(rate) if rate not in (None, "") else None,
                 funding_interval=int(item.get("funding_interval") or 28800),
+                basis_percent=_basis(ticker["last"], ticker.get("index_price")),
+                high_24h=float(ticker.get("high_24h") or 0) or None,
             )
     else:
         tradable = {
@@ -251,16 +361,13 @@ def load_universe() -> tuple[list[str], dict[str, Row]]:
             and item.get("contractType") == "PERPETUAL"
             and item.get("quoteAsset") == "USDT"
         }
-        funding = {
-            item["symbol"]: item.get("lastFundingRate")
-            for item in http_json(f"{API_BASE}/premiumIndex")
-        }
+        premium = {item["symbol"]: item for item in http_json(f"{API_BASE}/premiumIndex")}
         rows = {}
         for item in http_json(f"{API_BASE}/ticker/24hr"):
             symbol = item["symbol"]
             if symbol not in tradable:
                 continue
-            rate = funding.get(symbol)
+            rate = premium.get(symbol, {}).get("lastFundingRate")
             rows[symbol] = Row(
                 symbol=symbol,
                 base=tradable[symbol],
@@ -268,6 +375,8 @@ def load_universe() -> tuple[list[str], dict[str, Row]]:
                 change_percent=float(item.get("priceChangePercent") or 0),
                 quote_volume=float(item.get("quoteVolume") or 0),
                 funding_rate=float(rate) if rate not in (None, "") else None,
+                basis_percent=_basis(item["lastPrice"], premium.get(symbol, {}).get("indexPrice")),
+                high_24h=float(item.get("highPrice") or 0) or None,
             )
     if not rows:
         raise SystemExit(f"{SRC['label']} 未返回任何可交易合约，接口可能变更")
@@ -290,36 +399,51 @@ def apply_filters(rows: dict[str, Row]) -> tuple[list[str], dict[str, Row]]:
     return sorted(row.symbol for row in kept), rows
 
 
-def fetch_closes(symbol: str, interval: str) -> list[float]:
-    """收盘价，按时间升序，最后一根尚未收盘。"""
+def fetch_bars(symbol: str, interval: str) -> list[tuple[float, float, float, float]]:
+    """(最高, 最低, 收盘, 成交额)，按时间升序，最后一根尚未收盘。"""
     iv = SRC["interval_map"].get(interval, interval)
     if DATA_SOURCE == "gate":
         bars = http_json(f"{API_BASE}/candlesticks", {"contract": symbol, "interval": iv, "limit": KLINE_LIMIT})
-        return [float(bar["c"]) for bar in bars]
+        return [(float(b["h"]), float(b["l"]), float(b["c"]), float(b.get("sum") or 0)) for b in bars]
     bars = http_json(f"{API_BASE}/klines", {"symbol": symbol, "interval": iv, "limit": KLINE_LIMIT})
-    return [float(bar[4]) for bar in bars]
+    return [(float(b[2]), float(b[3]), float(b[4]), float(b[7])) for b in bars]
 
 
-def fetch_rsi(symbol: str) -> dict[str, float | None]:
-    result: dict[str, float | None] = {}
+def interval_metrics(bars: list[tuple[float, float, float, float]]) -> dict:
+    highs, lows, closes, volumes = zip(*bars)
+    series = wilder_rsi_series(list(closes), RSI_PERIOD)
+    atr = wilder_atr(list(highs), list(lows), list(closes), RSI_PERIOD)
+    return {
+        "rsi": series[-1] if series else None,
+        "rsi_prev": series[-4] if len(series) >= 4 else None,
+        "divergence": bearish_divergence(list(closes), series, DIV_LOOKBACK),
+        "vol_ratio": volume_ratio(list(volumes), VOL_LOOKBACK),
+        "pct_b": boll_percent_b(list(closes), BOLL_PERIOD),
+        "atr_pct": atr / closes[-1] * 100 if atr and closes[-1] else None,
+    }
+
+
+def fetch_metrics(symbol: str) -> dict[str, dict]:
+    result: dict[str, dict] = {}
     for interval in RSI_INTERVALS:
         try:
-            closes = fetch_closes(symbol, interval)
-            # 最后一根通常尚未收盘，用未收盘数据会导致 RSI 抖动和重复告警
-            closed = closes[:-1] if len(closes) > RSI_PERIOD + 1 else closes
-            result[interval] = wilder_rsi(closed, RSI_PERIOD)
-        except (RuntimeError, KeyError, TypeError, ValueError) as exc:
+            bars = fetch_bars(symbol, interval)
+            # 最后一根通常尚未收盘，用未收盘数据会让指标抖动、反复触发告警
+            closed = bars[:-1] if len(bars) > RSI_PERIOD + 1 else bars
+            result[interval] = interval_metrics(closed) if closed else {}
+        except (RuntimeError, KeyError, TypeError, ValueError, IndexError) as exc:
             log(f"{symbol} {interval} 取数失败: {exc}")
-            result[interval] = None
+            result[interval] = {}
     return result
 
 
 def screen(symbols: list[str], tickers: dict[str, Row]) -> list[Row]:
     rows: list[Row] = []
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for symbol, rsi in pool.map(lambda s: (s, fetch_rsi(s)), symbols):
+        for symbol, metrics in pool.map(lambda s: (s, fetch_metrics(s)), symbols):
             row = tickers[symbol]
-            row.rsi = rsi
+            row.metrics = metrics
+            row.rsi = {iv: (metrics.get(iv) or {}).get("rsi") for iv in RSI_INTERVALS}
             rows.append(row)
     return sorted(rows, key=lambda r: r.max_rsi, reverse=True)
 
@@ -370,6 +494,13 @@ def filter_summary() -> str:
     return " · ".join(parts)
 
 
+INDICATOR_NOTE = (
+    "指标均基于已收盘 K 线。量比＝末根成交额÷前 20 根均值（>1 放量、<1 缩量）；"
+    "基差＝(最新成交价−指数价)÷指数价，正数说明合约被买到现货之上；费率为正表示多头向空头支付。"
+    "摘要行给出 RSI 较 3 根前的变化、布林 %B、ATR 和距 24h 高点回撤。仅供参考，不构成投资建议。"
+)
+
+
 def render_text(rows: list[Row], generated: datetime) -> str:
     lines = [
         f"{SRC['label']} RSI>{RSI_THRESHOLD:g}（{', '.join(RSI_INTERVALS)}，{generated:%Y-%m-%d %H:%M} UTC）",
@@ -380,9 +511,11 @@ def render_text(rows: list[Row], generated: datetime) -> str:
         rsi_text = "  ".join(f"{i}={row.rsi[i]:.1f}" for i in RSI_INTERVALS if row.rsi.get(i) is not None)
         lines.append(
             f"{row.symbol}: {fmt_price(row.last_price)}  {row.change_percent:+.2f}%  {rsi_text}  "
-            f"费率{row.funding_text}  成交额{row.quote_volume / 1e6:.1f}M"
+            f"量比{row.vol_ratio_text}  基差{row.basis_text}  费率{row.funding_text}  "
+            f"成交额{row.quote_volume / 1e6:.1f}M"
         )
-    lines += ["", "基于已收盘 K 线，Wilder RSI；费率为正表示多头向空头支付。仅供参考，不构成投资建议。"]
+        lines.append(f"    {row.summary}")
+    lines += ["", INDICATOR_NOTE]
     return "\n".join(lines)
 
 
@@ -393,6 +526,8 @@ def render_html(rows: list[Row], generated: datetime) -> str:
         f'<th style="{th}right">最新价</th>'
         f'<th style="{th}right">24h</th>'
         + "".join(f'<th style="{th}right">RSI({escape(i)})</th>' for i in RSI_INTERVALS)
+        + f'<th style="{th}right">量比({escape(PRIMARY_INTERVAL)})</th>'
+        + f'<th style="{th}right">基差</th>'
         + f'<th style="{th}right">资金费率</th>'
         + f'<th style="{th}right">24h成交额</th>'
     )
@@ -407,6 +542,7 @@ def render_html(rows: list[Row], generated: datetime) -> str:
             color = "#c0392b" if value > RSI_THRESHOLD else "#222222"
             cells += f'<td style="padding:6px 10px;text-align:right;color:{color}">{value:.1f}</td>'
         url = SRC["trade_url"] + escape(row.symbol)
+        basis_color = "#b8860b" if (row.basis_percent or 0) > 0 else "#2e7d32"
         funding_color = "#b8860b" if (row.funding_rate or 0) > 0 else "#2e7d32"
         body.append(
             '<tr>'
@@ -414,11 +550,15 @@ def render_html(rows: list[Row], generated: datetime) -> str:
             f'<td style="padding:6px 10px;text-align:right">{escape(fmt_price(row.last_price))}</td>'
             f'<td style="padding:6px 10px;text-align:right">{row.change_percent:+.2f}%</td>'
             f'{cells}'
+            f'<td style="padding:6px 10px;text-align:right">{escape(row.vol_ratio_text)}</td>'
+            f'<td style="padding:6px 10px;text-align:right;color:{basis_color}">{escape(row.basis_text)}</td>'
             f'<td style="padding:6px 10px;text-align:right;color:{funding_color}">{escape(row.funding_text)}</td>'
             f'<td style="padding:6px 10px;text-align:right">{row.quote_volume / 1e6:.1f}M</td>'
             '</tr>'
+            f'<tr><td colspan="{7 + len(RSI_INTERVALS)}" '
+            f'style="padding:0 10px 8px;font-size:11px;color:#888888">{escape(row.summary)}</td></tr>'
         )
-    note = "基于已收盘 K 线，Wilder RSI；费率为正表示多头向空头支付。仅供参考，不构成投资建议。"
+    note = INDICATOR_NOTE
     intro = (
         f"周期 {escape(', '.join(RSI_INTERVALS))} · RSI 周期 {RSI_PERIOD} · 阈值 {RSI_THRESHOLD:g} · "
         f"匹配 {escape(MATCH_MODE)} · {escape(filter_summary())} · "
@@ -540,7 +680,10 @@ def main() -> int:
 
     for row in rows[:TOP_N_LOG]:
         detail = "  ".join(f"{i}={row.rsi[i]:.1f}" for i in RSI_INTERVALS if row.rsi.get(i) is not None)
-        log(f"{row.symbol:<16} {detail:<24} {row.change_percent:+7.2f}%  {row.funding_text:>14}  {row.quote_volume / 1e6:8.1f}M")
+        log(
+            f"{row.symbol:<16} {detail:<24} {row.change_percent:+7.2f}%  量比{row.vol_ratio_text:>5}  "
+            f"基差{row.basis_text:>9}  {row.funding_text:>14}  {row.quote_volume / 1e6:8.1f}M"
+        )
 
     hits = [r for r in rows if r.triggered(RSI_THRESHOLD, MATCH_MODE)]
     generated = datetime.now(timezone.utc)
